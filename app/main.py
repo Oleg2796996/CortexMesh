@@ -220,7 +220,7 @@ async def guards_and_log(request: Request, call_next):
     cl = request.headers.get("content-length")
     if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
         return JSONResponse(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             content={
                 "error": "payload_too_large",
                 "max_bytes": MAX_BODY_BYTES,
@@ -236,7 +236,7 @@ async def guards_and_log(request: Request, call_next):
         body = await request.body()
         if len(body) > MAX_BODY_BYTES:
             return JSONResponse(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 content={
                     "error": "payload_too_large",
                     "max_bytes": MAX_BODY_BYTES,
@@ -396,7 +396,7 @@ async def embed_pattern(
             model=body.model,
         )
     except ValueError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
     if not updated:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
@@ -445,7 +445,7 @@ async def _create_post_impl(request: Request) -> PostResponse:
     # Reject non-object root (e.g. arrays, scalars) with a clear message.
     if not isinstance(data, dict):
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             "request body must be a JSON object",
         )
 
