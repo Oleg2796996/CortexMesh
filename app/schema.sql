@@ -79,6 +79,9 @@ CREATE INDEX IF NOT EXISTS patterns_embedding_ivf_idx
 -- search_doc: FTS tsvector. Maintained by trigger (to_tsvector is not
 -- IMMUTABLE, so a STORED generated column is not allowed).
 -- ──────────────────────────────────────────────────────────────────────────────
+-- Drop the view first — it depends on search_doc, which we are about to
+-- drop+recreate.
+DROP VIEW IF EXISTS patterns_v CASCADE;
 ALTER TABLE patterns DROP COLUMN IF EXISTS search_doc;
 ALTER TABLE patterns ADD  COLUMN search_doc tsvector;
 
@@ -132,6 +135,8 @@ SELECT
     confidence,
     created_by,
     search_doc,
+    embedding,
+    embedded_model,
     (embedding IS NOT NULL) AS has_embedding,
     created_at,
     updated_at

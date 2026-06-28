@@ -237,3 +237,38 @@ def search_patterns_semantic(
             {"vec": vec_str, "limit": limit},
         )
         return list(cur.fetchall())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Embeddings
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+EMBEDDING_DIM = 384
+
+
+def update_pattern_embedding(
+    content_hash: str,
+    embedding: list[float],
+    model: str,
+) -> bool:
+    """Attach an external-computed embedding to an existing pattern.
+
+    Returns True if a row was updated, False if no pattern has that content_hash.
+    """
+    if len(embedding) != EMBEDDING_DIM:
+        raise ValueError(
+            f"embedding must be {EMBEDDING_DIM}-dim float vector, got {len(embedding)}"
+        )
+    vec_str = "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE patterns
+               SET embedding = %(vec)s::vector,
+                   embedded_model = %(model)s
+             WHERE content_hash = %(h)s
+            """,
+            {"vec": vec_str, "model": model, "h": content_hash},
+        )
+        return cur.rowcount > 0

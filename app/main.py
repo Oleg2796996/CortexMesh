@@ -44,6 +44,7 @@ from fastapi.exceptions import RequestValidationError
 import psycopg
 
 from . import db as dbmod
+from . import ratelimit
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
@@ -100,10 +101,8 @@ async def require_api_key(key: Annotated[str | None, Depends(api_key_header)]) -
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Rate limiting (per IP, sliding minute, token bucket-lite)
+# Rate limiting (Redis sliding-window, per IP)
 # ──────────────────────────────────────────────────────────────────────────────
-
-_buckets: dict[str, deque[float]] = defaultdict(deque)
 
 
 def _client_ip(request: Request) -> str:
@@ -114,16 +113,13 @@ def _client_ip(request: Request) -> str:
 
 
 async def rate_limit(request: Request) -> None:
-    bucket = _buckets[_client_ip(request)]
-    now = time.monotonic()
-    while bucket and now - bucket[0] > 60:
-        bucket.popleft()
-    if len(bucket) >= RATE_LIMIT_PER_MIN:
+    allowed, count, limit = ratelimit.check("ip", _client_ip(request))
+    if not allowed:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
-            f"rate limit exceeded ({RATE_LIMIT_PER_MIN}/min)",
+            f"rate limit exceeded ({count}/{limit} per {ratelimit.WINDOW_S}s)",
+            headers={"Retry-After": str(ratelimit.WINDOW_S)},
         )
-    bucket.append(now)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -152,6 +148,35 @@ class PostResponse(BaseModel):
     status: Literal["success"] = "success"
     post_id: str
     content_hash: str
+
+
+class EmbedRequest(BaseModel):
+    """Attach an externally-computed embedding to an existing pattern.
+
+    The API never computes embeddings — agents run their own embedder (e.g.
+    BAAI/bge-small-en-v1.5) and POST the resulting vector back. This keeps
+    the API stateless, model-agnostic, and small.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content_hash: str = Field(min_length=8, max_length=200)
+    embedding: List[float] = Field(min_length=dbmod.EMBEDDING_DIM, max_length=dbmod.EMBEDDING_DIM)
+    model: str = Field(min_length=1, max_length=128)
+
+
+class EmbedResponse(BaseModel):
+    status: Literal["success"] = "success"
+    content_hash: str
+    dimension: int
+    embedded_model: str
+
+
+class SemanticSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    embedding: List[float] = Field(min_length=dbmod.EMBEDDING_DIM, max_length=dbmod.EMBEDDING_DIM)
+    limit: int = Field(default=10, ge=1, le=100)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -280,6 +305,12 @@ async def health() -> dict:
         "version": app.version,
         "patterns": dbmod.count_patterns() if USE_DB else 0,
         "storage": "postgres" if USE_DB else "memory",
+        "redis": ratelimit.ping(),
+        "rate_limit": {
+            "per_window": ratelimit.PER_MIN,
+            "window_seconds": ratelimit.WINDOW_S,
+            "fail_closed": ratelimit.FAIL_CLOSED,
+        },
     }
     return body
 
@@ -317,6 +348,65 @@ async def search_posts(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "q parameter required")
     results = dbmod.search_patterns_lexical(q, limit=limit)
     return {"query": q, "count": len(results), "results": results}
+
+
+@app.post("/posts/search/semantic", tags=["patterns"])
+async def search_posts_semantic(
+    body: SemanticSearchRequest,
+    _: Annotated[str, Depends(require_api_key)],
+    __: Annotated[None, Depends(rate_limit)],
+) -> dict:
+    """Cosine-similarity search over stored embeddings.
+
+    Body is the query embedding (computed by the caller). Returns the top-N
+    patterns sorted by similarity, with cosine_sim ∈ [-1, 1].
+    """
+    if not USE_DB:
+        return {"count": 0, "results": [], "note": "search disabled (db off)"}
+    results = dbmod.search_patterns_semantic(body.embedding, limit=body.limit)
+    return {"count": len(results), "results": results}
+
+
+@app.post(
+    "/embed",
+    response_model=EmbedResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["patterns"],
+)
+async def embed_pattern(
+    body: EmbedRequest,
+    _: Annotated[str, Depends(require_api_key)],
+    __: Annotated[None, Depends(rate_limit)],
+) -> EmbedResponse:
+    """Attach a pre-computed embedding to an existing pattern.
+
+    The API does not run any embedding model itself. Callers run their own
+    embedder (e.g. BAAI/bge-small-en-v1.5, sentence-transformers/all-MiniLM-L6-v2)
+    and POST the resulting vector here. This keeps the API stateless and
+    avoids pinning one model's runtime inside the coordinator.
+    """
+    if not USE_DB:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "embedding storage requires db"
+        )
+    try:
+        updated = dbmod.update_pattern_embedding(
+            content_hash=body.content_hash,
+            embedding=body.embedding,
+            model=body.model,
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+    if not updated:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"no pattern with content_hash={body.content_hash!r}",
+        )
+    return EmbedResponse(
+        content_hash=body.content_hash,
+        dimension=len(body.embedding),
+        embedded_model=body.model,
+    )
 
 
 @app.post(
@@ -451,6 +541,13 @@ async def _startup() -> None:
             log.info("postgres connected, %d patterns", n)
         except Exception as exc:
             log.error("postgres connect failed: %s", exc)
+    if ratelimit.ping():
+        log.info("redis rate-limiter connected (%s)", ratelimit.REDIS_URL)
+    else:
+        log.warning(
+            "redis rate-limiter NOT reachable (%s); requests will fail-open",
+            ratelimit.REDIS_URL,
+        )
 
 
 @app.on_event("shutdown")
