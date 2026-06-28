@@ -9,7 +9,7 @@ TLS_PORT?= 8443
 BASE    ?= http://127.0.0.1:$(PORT)
 TLS_BASE?= https://127.0.0.1:$(TLS_PORT)
 
-.PHONY: help venv install run stop logs health smoke smoke-v112 smoke-tls smoke-all schema migrate clean prod-build prod-up prod-down prod-logs
+.PHONY: help venv install run stop logs health smoke smoke-v112 smoke-tls smoke-all schema migrate clean prod-build prod-up prod-down prod-logs deploy-prod rollback-prod backup-db logs-prod
 
 help:
 	@echo "CortexMesh v1.1.1 — make targets:"
@@ -26,6 +26,11 @@ help:
 	@echo "  make prod-up       docker compose up -d (TLS on :443)"
 	@echo "  make prod-down     docker compose down"
 	@echo "  make prod-logs     docker compose logs -f --tail=100"
+	@echo "  --- prod (Track A scripts) ---"
+	@echo "  make deploy-prod    bash scripts/deploy_prod.sh  (full safe deploy)"
+	@echo "  make rollback-prod  bash scripts/rollback_prod.sh (down + best-effort fallback)"
+	@echo "  make backup-db      bash scripts/backup_db.sh    (gzip + retain last 7)"
+	@echo "  make logs-prod      docker compose logs -f --tail=100 api nginx db redis"
 
 install:
 	@if [ ! -d .venv ]; then python3 -m venv .venv; fi
@@ -78,6 +83,22 @@ prod-down:
 
 prod-logs:
 	docker compose logs -f --tail=100
+
+# ─── Track A: production deploy / rollback / backup ─────────────────────────
+# These call the scripts in ./scripts/ which do real preflight + healthcheck
+# loops. They are idempotent — re-running will not corrupt the stack.
+
+deploy-prod:
+	@bash scripts/deploy_prod.sh
+
+rollback-prod:
+	@bash scripts/rollback_prod.sh
+
+backup-db:
+	@bash scripts/backup_db.sh
+
+logs-prod:
+	docker compose logs -f --tail=100 api nginx db redis
 
 clean:
 	@find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
