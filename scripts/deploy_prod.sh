@@ -45,6 +45,10 @@ SMOKE_URL="https://${PROD_HOST}:${TLS_PORT}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-120}"   # seconds to wait for db / api
 COMPOSE="${COMPOSE_CMD:-docker compose}"
 
+# Minimum free space (MB) on the filesystem backing REPO_ROOT.
+# First docker build + pull = ~700 MB; pgvector WAL grows ~50 MB / day.
+MIN_DISK_FREE_MB="${MIN_DISK_FREE_MB:-2048}"
+
 # ─── 0. shell sanity ────────────────────────────────────────────────────────
 [ "${BASH_VERSINFO[0]}" -ge 4 ] || die "needs bash ≥ 4"
 
@@ -52,6 +56,19 @@ COMPOSE="${COMPOSE_CMD:-docker compose}"
 command -v docker >/dev/null 2>&1 || die "docker not installed"
 ${COMPOSE} version >/dev/null 2>&1 \
   || die "docker compose plugin missing (install docker-compose-plugin)"
+
+# ─── 1b. preflight: disk space ──────────────────────────────────────────────
+if command -v df >/dev/null 2>&1; then
+  AVAIL_KB="$(df -Pk "${REPO_ROOT}" 2>/dev/null | awk 'NR==2 {print $4}')"
+  AVAIL_MB="$((AVAIL_KB / 1024))"
+  if [ -z "${AVAIL_KB}" ] || [ "${AVAIL_KB}" -eq 0 ]; then
+    warn "could not determine free space at ${REPO_ROOT}"
+  elif [ "${AVAIL_MB}" -lt "${MIN_DISK_FREE_MB}" ]; then
+    die "only ${AVAIL_MB} MB free at ${REPO_ROOT} (need ≥ ${MIN_DISK_FREE_MB} MB). Free space (docker system prune? rotate logs? expand volume?) and retry."
+  else
+    log "disk OK: ${AVAIL_MB} MB free at ${REPO_ROOT} (threshold ${MIN_DISK_FREE_MB} MB)"
+  fi
+fi
 
 # ─── 2. preflight: .env ─────────────────────────────────────────────────────
 [ -f .env ] || die ".env not found at repo root. Copy .env.example and edit it."

@@ -29,6 +29,9 @@ COMPOSE="${COMPOSE_CMD:-docker compose}"
 KEEP_VOLUMES="${KEEP_VOLUMES:-1}"
 FALLBACK_TAG="${FALLBACK_TAG:-cortexmesh-api:v1.1.0}"
 
+# Same gate as backup_db.sh — rollback snapshots also land in backups/.
+MIN_DISK_FREE_MB="${MIN_DISK_FREE_MB:-512}"
+
 command -v docker >/dev/null 2>&1 || die "docker not installed"
 ${COMPOSE} version >/dev/null 2>&1 || die "docker compose plugin missing"
 
@@ -45,6 +48,16 @@ fi
 # ─── 1. snapshot current state for post-mortem ─────────────────────────────
 log "snapshotting current state into backups/…"
 mkdir -p backups
+
+if command -v df >/dev/null 2>&1; then
+  AVAIL_KB="$(df -Pk backups 2>/dev/null | awk 'NR==2 {print $4}')"
+  AVAIL_MB="$((AVAIL_KB / 1024))"
+  if [ -n "${AVAIL_KB}" ] && [ "${AVAIL_KB}" -ne 0 ] \
+     && [ "${AVAIL_MB}" -lt "${MIN_DISK_FREE_MB}" ]; then
+    die "only ${AVAIL_MB} MB free at backups/ (need ≥ ${MIN_DISK_FREE_MB} MB). Free space before rollback."
+  fi
+fi
+
 SNAP="backups/rollback_${COMPOSE_PROJECT_NAME:-cortexmesh}_$(date -u +%Y%m%dT%H%M%SZ).log"
 ${COMPOSE} ps           > "${SNAP}.ps"           2>&1 || true
 ${COMPOSE} images       > "${SNAP}.images"       2>&1 || true

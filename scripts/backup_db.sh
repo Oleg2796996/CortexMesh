@@ -27,6 +27,11 @@ cd "${REPO_ROOT}"
 COMPOSE="${COMPOSE_CMD:-docker compose}"
 RETAIN="${RETAIN:-7}"
 
+# Minimum free space (MB) needed in the backups dir BEFORE dumping.
+# A full cortexmesh pg_dump gzip'd ≈ 20 MB today; we keep 7 = 140 MB.
+# Threshold is generous so daily cron doesn't pile up on a forgotten host.
+MIN_DISK_FREE_MB="${MIN_DISK_FREE_MB:-512}"
+
 command -v docker >/dev/null 2>&1 || die "docker not installed"
 ${COMPOSE} version >/dev/null 2>&1 || die "docker compose plugin missing"
 
@@ -43,6 +48,19 @@ if ! ${COMPOSE} ps --services --status running 2>/dev/null | grep -qx db; then
 fi
 
 mkdir -p backups
+
+# Disk gate — bail before we fill the volume with a half-dump + rotation backlog.
+if command -v df >/dev/null 2>&1; then
+  AVAIL_KB="$(df -Pk backups 2>/dev/null | awk 'NR==2 {print $4}')"
+  AVAIL_MB="$((AVAIL_KB / 1024))"
+  if [ -z "${AVAIL_KB}" ] || [ "${AVAIL_KB}" -eq 0 ]; then
+    warn "could not determine free space at backups/"
+  elif [ "${AVAIL_MB}" -lt "${MIN_DISK_FREE_MB}" ]; then
+    die "only ${AVAIL_MB} MB free at backups/ (need ≥ ${MIN_DISK_FREE_MB} MB). Prune old backups or expand volume."
+  else
+    log "disk OK: ${AVAIL_MB} MB free at backups/ (threshold ${MIN_DISK_FREE_MB} MB)"
+  fi
+fi
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="backups/cortex_${TS}.sql.gz"

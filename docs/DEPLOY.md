@@ -197,6 +197,35 @@ Wire `make backup-db` to a cron job on the VPS for nightly backups at 03:30 UTC:
 30 3 * * *  cd /opt/cortexmesh && /usr/bin/make backup-db >> /var/log/cortexmesh-backup.log 2>&1
 ```
 
+### Disk monitoring
+
+The deploy / rollback / backup scripts all run a free-space preflight before
+any heavy I/O — they'll refuse to start and print a clear error if the
+volume is too tight. Tunable via `MIN_DISK_FREE_MB` env var
+(defaults: **2048 MB** for `deploy_prod.sh`, **512 MB** for `backup_db.sh`
+and `rollback_prod.sh`).
+
+Roughly what you'll see on a healthy VPS running v1.1.1:
+
+| Path                                                        | Typical size |
+|-------------------------------------------------------------|--------------|
+| `/var/lib/docker/volumes/cortexmesh-pgdata` (pgvector)      | 200–500 MB   |
+| `/var/lib/docker/volumes/cortexmesh-redis`                  | 5–20 MB      |
+| `/var/lib/docker/volumes/cortexmesh-certs`                  | 10 KB        |
+| `backups/` (7 × gzip'd pg_dump)                             | 150 MB       |
+| `docker images` (api + db + redis + nginx)                  | ~1.2 GB      |
+
+Quick health check you can wire into your own cron / monitoring:
+
+```bash
+# Crontab entry — alerts when free space < 5 GB on the volume backing /opt/cortexmesh
+*/30 * * * *  AVAIL=$(df -P /opt/cortexmesh | awk 'NR==2 {print $4}'); \
+  [ "$AVAIL" -lt 5242880 ] && \
+  curl -fsS -X POST https://your-monitoring/webhook -d "cortexmesh disk low: $((AVAIL/1024)) MB" || true
+```
+
+Or just eye-ball it: `df -h /opt/cortexmesh` from the VPS shell.
+
 ---
 
 ## 8. Rollback
