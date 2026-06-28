@@ -192,7 +192,7 @@ USE_DB = os.environ.get("CORTEXMESH_DISABLE_DB", "0") != "1"
 
 app = FastAPI(
     title="CortexMesh Coordinator API",
-    version="1.1.0",
+    version="1.1.1",
     description="Federated discovery layer for Crystalline Patterns.",
     docs_url="/docs",
     redoc_url=None,
