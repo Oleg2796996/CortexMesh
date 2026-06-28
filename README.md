@@ -172,20 +172,58 @@ bash /tmp/cm_smoke_v112.sh   # v1.1.1 (28 scenarios; Redis + embeddings)
 
 ## 📦 Deployment
 
-The coordinator is a stateless FastAPI app behind a reverse proxy that
-terminates TLS. A `docker-compose.yml` brings up the API + Postgres + Redis
-as one stack — see `docker-compose.yml` and `Dockerfile.api`.
+The coordinator is a stateless FastAPI app behind nginx that terminates TLS.
+A `docker-compose.yml` brings up the full tier as one stack:
 
-Rolling out a new version on the VPS:
+- **`db`** — Postgres 16 + pgvector (system of record)
+- **`redis`** — Redis 7 (sliding-window rate-limit, ephemeral)
+- **`api`** — FastAPI coordinator (image built from `Dockerfile`, two workers)
+- **`migrate`** — one-shot init container applying `app/schema.sql`
+- **`nginx`** — TLS termination on :443, reverse-proxy to api:8000
+
+### First-time deploy
 
 ```bash
-ssh <vps>
+# 1. Clone on the VPS.
+git clone https://github.com/Oleg2796996/CortexMesh.git /opt/cortexmesh
+cd /opt/cortexmesh
+
+# 2. Configure secrets (the compose refuses to start without these).
+cp .env.example .env
+$EDITOR .env    # set POSTGRES_PASSWORD and CORTEXMESH_API_KEY to long randoms
+
+# 3. Drop in TLS cert (e.g. Let's Encrypt via certbot).
+sudo certbot certonly --standalone -d cortex.example.com
+sudo cp /etc/letsencrypt/live/cortex.example.com/fullchain.pem secrets/cert.pem
+sudo cp /etc/letsencrypt/live/cortex.example.com/privkey.pem   secrets/key.pem
+sudo chmod 600 secrets/*
+
+# 4. Bring it up.
+docker compose build
+docker compose up -d
+
+# 5. Verify.
+curl -s https://cortex.example.com/health | jq
+# expect: {"status":"online","version":"1.1.1","storage":"postgres","redis":true,...}
+```
+
+### Rolling out a new version
+
+```bash
+ssh cortex.example.com
 cd /opt/cortexmesh
 git pull
 docker compose build api
 docker compose up -d
-curl http://localhost:8000/health   # verify storage:postgres, redis:true
+curl -s https://cortex.example.com/health | jq .version
 ```
+
+### Local dev without Docker
+
+See the [🏗 Local development](#-local-development) section above. For TLS
+without Docker, use the dev nginx config (`/etc/nginx/sites-available/cortexmesh-local-tls`)
+that ships in this repo; it binds to `127.0.0.1:8443` and uses a self-signed
+cert so you can smoke-test the HTTPS path.
 
 ---
 

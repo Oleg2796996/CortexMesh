@@ -1,33 +1,127 @@
-version: '3.8'
+# CortexMesh production stack (v1.1.1).
+#
+# One docker-compose brings up the whole tier:
+#   - db      : Postgres 16 + pgvector (system of record)
+#   - redis   : Redis 7 (sliding-window rate-limit)
+#   - api     : FastAPI coordinator (image built from this repo's Dockerfile)
+#   - nginx   : TLS termination, reverse-proxy to api:8000
+#
+# First-time bootstrap:
+#   1. Place TLS cert at ./secrets/cert.pem and key at ./secrets/key.pem
+#      (e.g. via `certbot certonly --standalone -d cortex.example.com`).
+#   2. Set CORTEXMESH_API_KEY in `.env` to a long random string.
+#   3. `docker compose up -d`.
+#   4. `curl https://cortex.example.com/health` — expect "version":"1.1.1".
+
+version: "3.9"
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
 
 services:
   db:
     image: pgvector/pgvector:pg16
-    container_name: agentmesh-db
+    container_name: cortexmesh-db
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: agentmesh
-      POSTGRES_USER: mesh
-      POSTGRES_PASSWORD: meshpassword
+      POSTGRES_DB: cortexmesh
+      POSTGRES_USER: cortexmesh
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
-    restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mesh -d agentmesh"]
+      test: ["CMD-SHELL", "pg_isready -U cortexmesh -d cortexmesh"]
       interval: 5s
       timeout: 5s
+      retries: 10
+    logging: *default-logging
+    # db is on the internal network only — not exposed to the host.
+
+  redis:
+    image: redis:7-alpine
+    container_name: cortexmesh-redis
+    restart: unless-stopped
+    # No persistence: the rate-limit bucket is ephemeral by design (a window
+    # of < 60 seconds). Persistent Redis would just bloat the volume.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--bind", "127.0.0.1"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
       retries: 5
+    logging: *default-logging
 
   api:
-    build: .
-    container_name: agentmesh-api
-    ports:
-      - "8000:8000"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cortexmesh-api
+    restart: unless-stopped
     environment:
-      - DATABASE_URL=postgresql+asyncpg://mesh:meshpassword@db:5432/agentmesh
+      CORTEXMESH_API_KEY: ${CORTEXMESH_API_KEY:?set CORTEXMESH_API_KEY in .env}
+      CORTEXMESH_DB_DSN:   postgresql://cortexmesh:${POSTGRES_PASSWORD}@db:5432/cortexmesh
+      CORTEXMESH_REDIS_URL: redis://redis:6379/0
+      CORTEXMESH_USE_DB:   "1"
+      CORTEXMESH_RATE_PER_MIN: "60"
+      CORTEXMESH_RL_WINDOW_S:  "60"
+      CORTEXMESH_RL_FAIL_CLOSED: "0"
+      CORTEXMESH_EMBEDDING_DIM: "384"
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Run schema.sql on first start via a one-shot init container.
+    init: true
+    logging: *default-logging
+    # api listens on the internal network only — nginx is the public face.
+
+  migrate:
+    # One-shot container that applies schema.sql on first start (or any
+    # time the schema changes). Idempotent because the SQL uses
+    # IF NOT EXISTS / CREATE OR REPLACE / DROP IF EXISTS everywhere.
+    image: pgvector/pgvector:pg16
+    container_name: cortexmesh-migrate
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./app/schema.sql:/schema.sql:ro
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        export PGPASSWORD=$${POSTGRES_PASSWORD}
+        psql -h db -U cortexmesh -d cortexmesh -v ON_ERROR_STOP=1 -f /schema.sql
+        echo "schema applied at $$(date -Iseconds)"
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    restart: "no"
+    logging: *default-logging
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: cortexmesh-nginx
     restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/conf.d/cortexmesh.conf:ro
+      - ./secrets:/etc/ssl/cortexmesh:ro
+    logging: *default-logging
 
 volumes:
   pgdata:
+    name: cortexmesh-pgdata
+
+networks:
+  default:
+    name: cortexmesh

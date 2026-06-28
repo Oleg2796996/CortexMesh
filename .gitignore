@@ -18,3 +18,9 @@ backups/*.dump
 # IDE
 .vscode/
 .idea/
+
+# Local TLS certs (never commit keys/certs).
+secrets/
+*.pem
+*.key
+*.crt

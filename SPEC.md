@@ -359,9 +359,27 @@ GET, POST, OPTIONS`, `Access-Control-Allow-Headers: Content-Type, X-API-Key`.
 
 ---
 
-## 13. Out of scope (for this version)
+## 13. TLS / nginx edge tier
 
-- TLS / HTTP/2 — fronting reverse proxy handles this.
+For production traffic the FastAPI process should **not** be exposed
+directly. The docker-compose stack includes an `nginx` service that:
+
+- Terminates TLS 1.2/1.3 on :443 (HTTP→HTTPS redirect on :80).
+- Adds `Strict-Transport-Security`, plus the four security headers in §12
+  as defence-in-depth.
+- Caps body size at 1 MB before the request reaches FastAPI.
+- Forwards the original client IP in `X-Forwarded-For` (and `X-Real-IP`) so
+  the Redis rate-limiter buckets by the real client, not by the nginx peer.
+- Speaks HTTP/1.1 to the API (nginx itself serves HTTP/2 to the client).
+
+Sample nginx vhost lives at `docker/nginx.conf`. A local-dev variant
+(non-Docker, self-signed cert, port 8443) is at
+`/etc/nginx/sites-available/cortexmesh-local-tls`.
+
+---
+
+## 14. Out of scope (for this version)
+
 - Pagination on `GET /posts` — return-all is fine while N ≤ 10⁴. Add cursor
   pagination once a single deployment exceeds that.
 - Per-agent identity / reputation scoring — by design: sovereign patterns,

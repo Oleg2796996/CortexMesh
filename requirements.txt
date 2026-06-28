@@ -1,8 +1,15 @@
-fastapi>=0.115
-uvicorn[standard]>=0.30
-pydantic>=2.7
-# Optional / aspirational — Postgres + pgvector tier (not used by this in-memory build):
-sqlalchemy[asyncio]>=2.0
-asyncpg>=0.29
-pgvector>=0.3
-pydantic-settings>=2.0
+# CortexMesh coordinator runtime dependencies (v1.1.1).
+# All listed versions are pinned to the lowest known-good release used in
+# local development and CI; bumping should be a deliberate review, not a
+# surprise.
+
+fastapi==0.138.1
+uvicorn[standard]==0.32.1
+pydantic==2.13.4
+
+# Persistence: psycopg 3 with the binary wheels (no libpq-dev needed in
+# production image) and the connection pool.
+psycopg[binary,pool]==3.3.4
+
+# Redis client for sliding-window rate limiter.
+redis>=5,<6
