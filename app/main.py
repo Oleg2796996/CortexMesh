@@ -26,7 +26,7 @@ import re
 import time
 import uuid
 from collections import defaultdict, deque
-from typing import Annotated, List, Literal
+from typing import Annotated, List, Literal, Optional
 
 from fastapi import (
     Depends,
@@ -41,6 +41,9 @@ from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, ConfigDict, Field, confloat, ValidationError
 from fastapi.exceptions import RequestValidationError
+import psycopg
+
+from . import db as dbmod
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
@@ -152,10 +155,10 @@ class PostResponse(BaseModel):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Storage (still in-memory; B-Д is a separate ticket)
+# Storage (Postgres)
 # ──────────────────────────────────────────────────────────────────────────────
 
-mock_db: list[dict] = []
+USE_DB = os.environ.get("CORTEXMESH_DISABLE_DB", "0") != "1"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -271,20 +274,49 @@ async def guards_and_log(request: Request, call_next):
 @app.get("/health", tags=["meta"])
 @app.get("/status", tags=["meta"])
 async def health() -> dict:
-    return {
+    body = {
         "status": "online",
         "message": "CortexMesh coordinator is breathing",
         "version": app.version,
-        "patterns": len(mock_db),
+        "patterns": dbmod.count_patterns() if USE_DB else 0,
+        "storage": "postgres" if USE_DB else "memory",
     }
+    return body
 
 
 @app.get("/posts", response_model=List[dict], tags=["patterns"])
 async def list_posts(
     _: Annotated[str, Depends(require_api_key)],
     __: Annotated[None, Depends(rate_limit)],
+    limit: int = 200,
+    offset: int = 0,
+    type: Optional[str] = None,
+    tag: Optional[str] = None,
 ) -> list[dict]:
-    return list(mock_db)
+    if not USE_DB:
+        return []
+    return dbmod.list_patterns(limit=limit, offset=offset, post_type=type, tag=tag)
+
+
+@app.get("/posts/search", tags=["patterns"])
+async def search_posts(
+    q: str,
+    _: Annotated[str, Depends(require_api_key)],
+    __: Annotated[None, Depends(rate_limit)],
+    limit: int = 20,
+) -> dict:
+    """Lexical+FTS search over problem/solution/tags.
+
+    For semantic (vector) search, set up an embedder and use the /embed
+    endpoint or POST patterns with an `embedding` payload — see SPEC.md.
+    """
+    if not USE_DB:
+        return {"query": q, "results": [], "note": "search disabled (db off)"}
+    q = (q or "").strip()
+    if not q:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "q parameter required")
+    results = dbmod.search_patterns_lexical(q, limit=limit)
+    return {"query": q, "count": len(results), "results": results}
 
 
 @app.post(
@@ -358,7 +390,22 @@ async def _create_post_impl(request: Request) -> PostResponse:
     post_id = str(uuid.uuid4())
 
     record = safe.model_dump() | {"post_id": post_id, "content_hash": content_hash}
-    mock_db.append(record)
+
+    if USE_DB:
+        try:
+            dbmod.insert_pattern(record)
+        except psycopg.errors.UniqueViolation:
+            # Same content already exists — return the existing record.
+            existing = dbmod.get_pattern_by_hash(content_hash)
+            if existing:
+                return PostResponse(
+                    post_id=str(existing["post_id"]),
+                    content_hash=existing["content_hash"],
+                )
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "duplicate content_hash",
+            )
 
     return PostResponse(post_id=post_id, content_hash=content_hash)
 
@@ -369,7 +416,8 @@ async def _create_post_impl(request: Request) -> PostResponse:
 
 
 def _custom_openapi():
-    schema = app.openapi()
+    # Call the *original* FastAPI.openapi, not our overridden one (recursion).
+    schema = FastAPI.openapi(app)
     schema.setdefault("components", {}).setdefault("securitySchemes", {})
     schema["components"]["securitySchemes"]["ApiKeyAuth"] = {
         "type": "apiKey",
@@ -388,6 +436,26 @@ def _custom_openapi():
 
 
 app.openapi = _custom_openapi  # type: ignore[assignment]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lifecycle
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    if USE_DB:
+        try:
+            n = dbmod.count_patterns()
+            log.info("postgres connected, %d patterns", n)
+        except Exception as exc:
+            log.error("postgres connect failed: %s", exc)
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    dbmod.close_pool()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
