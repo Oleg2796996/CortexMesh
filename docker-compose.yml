@@ -80,26 +80,27 @@ services:
     # api listens on the internal network only — nginx is the public face.
 
   migrate:
-    # One-shot container that applies schema.sql on first start (or any
-    # time the schema changes). Idempotent because the SQL uses
-    # IF NOT EXISTS / CREATE OR REPLACE / DROP IF EXISTS everywhere.
-    image: pgvector/pgvector:pg16
+    # One-shot container that runs Alembic migrations. Idempotent — Alembic
+    # only applies the diff between the current DB revision and HEAD. Schema
+    # source of truth is now `alembic/versions/*.py` (not app/schema.sql).
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: cortexmesh-migrate
     depends_on:
       db:
         condition: service_healthy
-    volumes:
-      - ./app/schema.sql:/schema.sql:ro
+    environment:
+      CORTEXMESH_DB_DSN: postgresql://cortexmesh:${POSTGRES_PASSWORD}@db:5432/cortexmesh
     entrypoint:
       - bash
       - -c
       - |
         set -euo pipefail
-        export PGPASSWORD=$${POSTGRES_PASSWORD}
-        psql -h db -U cortexmesh -d cortexmesh -v ON_ERROR_STOP=1 -f /schema.sql
+        cd /app
+        echo "alembic current: $$(alembic current 2>/dev/null || echo none)"
+        alembic upgrade head
         echo "schema applied at $$(date -Iseconds)"
-    environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     restart: "no"
     logging: *default-logging
 

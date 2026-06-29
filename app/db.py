@@ -20,9 +20,13 @@ from psycopg_pool import ConnectionPool
 
 log = logging.getLogger("cortexmesh.db")
 
-DB_DSN = os.environ.get(
-    "CORTEXMESH_DATABASE_URL",
-    "postgresql://cortexmesh:cortexmesh_dev_password@127.0.0.1:5432/cortexmesh",
+# Read DSN from env. Two names are accepted for historical reasons:
+#   - CORTEXMESH_DB_DSN        (docker-compose, prod convention)
+#   - CORTEXMESH_DATABASE_URL  (early dev convention, kept for back-compat)
+DB_DSN = (
+    os.environ.get("CORTEXMESH_DB_DSN")
+    or os.environ.get("CORTEXMESH_DATABASE_URL")
+    or "postgresql://cortexmesh:cortexmesh_dev_password@127.0.0.1:5432/cortexmesh"
 )
 
 # Small pool — the API is per-IP rate-limited anyway, and an under-provisioned

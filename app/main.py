@@ -45,6 +45,7 @@ import psycopg
 
 from . import db as dbmod
 from . import ratelimit
+from . import metrics
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
@@ -89,6 +90,7 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 async def require_api_key(key: Annotated[str | None, Depends(api_key_header)]) -> str:
     if not key or key != API_KEY:
+        metrics.http_auth_failures_total.inc()
         # Constant-time compare to avoid trivial timing leaks.
         if not key or not API_KEY or len(key) != len(API_KEY):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid api key")
@@ -115,6 +117,7 @@ def _client_ip(request: Request) -> str:
 async def rate_limit(request: Request) -> None:
     allowed, count, limit = ratelimit.check("ip", _client_ip(request))
     if not allowed:
+        metrics.http_rate_limited_total.inc()
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
             f"rate limit exceeded ({count}/{limit} per {ratelimit.WINDOW_S}s)",
@@ -192,7 +195,7 @@ USE_DB = os.environ.get("CORTEXMESH_DISABLE_DB", "0") != "1"
 
 app = FastAPI(
     title="CortexMesh Coordinator API",
-    version="1.1.1",
+    version="1.1.2",
     description="Federated discovery layer for Crystalline Patterns.",
     docs_url="/docs",
     redoc_url=None,
@@ -219,6 +222,7 @@ async def guards_and_log(request: Request, call_next):
     # we read below so clients cannot lie about Content-Length.
     cl = request.headers.get("content-length")
     if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
+        metrics.http_payload_rejected_total.labels(reason="payload_too_large").inc()
         return JSONResponse(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             content={
@@ -235,6 +239,7 @@ async def guards_and_log(request: Request, call_next):
     if request.method in ("POST", "PUT", "PATCH"):
         body = await request.body()
         if len(body) > MAX_BODY_BYTES:
+            metrics.http_payload_rejected_total.labels(reason="payload_too_large").inc()
             return JSONResponse(
                 status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 content={
@@ -245,6 +250,7 @@ async def guards_and_log(request: Request, call_next):
             )
         ct = (request.headers.get("content-type") or "").lower()
         if "application/json" not in ct:
+            metrics.http_payload_rejected_total.labels(reason="unsupported_media_type").inc()
             return JSONResponse(
                 status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
                 content={
@@ -254,6 +260,7 @@ async def guards_and_log(request: Request, call_next):
                 },
             )
         if not body.strip():
+            metrics.http_payload_rejected_total.labels(reason="empty_body").inc()
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={"error": "empty_body"},
@@ -262,6 +269,7 @@ async def guards_and_log(request: Request, call_next):
         try:
             request.state.json_body = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            metrics.http_payload_rejected_total.labels(reason="invalid_json").inc()
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={"error": "invalid_json", "detail": str(exc)},
@@ -269,7 +277,24 @@ async def guards_and_log(request: Request, call_next):
 
     started = time.monotonic()
     response: Response = await call_next(request)
-    dur_ms = int((time.monotonic() - started) * 1000)
+    dur_s = time.monotonic() - started
+    dur_ms = int(dur_s * 1000)
+
+    # Metrics: only record labeled counters after we have the response.
+    # Use FastAPI's route template (e.g. /posts/{post_id}) instead of the
+    # raw path to keep label cardinality bounded.
+    route = request.scope.get("route")
+    path_template = getattr(route, "path", request.url.path)
+    cls = metrics.status_class(response.status_code)
+    metrics.http_requests_total.labels(
+        method=request.method,
+        path_template=path_template,
+        status_class=cls,
+    ).inc()
+    metrics.http_request_duration_seconds.labels(
+        method=request.method,
+        path_template=path_template,
+    ).observe(dur_s)
 
     log.info(
         json.dumps(
@@ -315,6 +340,56 @@ async def health() -> dict:
     return body
 
 
+@app.get("/health/deep", tags=["meta"])
+async def health_deep() -> dict:
+    """Deep health: actually pings Postgres and Redis.
+
+    Returns 200 with `db.up=true` / `redis.up=true` if both are reachable.
+    If a dependency is down, returns 503 so a load-balancer can pull
+    the instance out of rotation.
+    """
+    db_ok = False
+    redis_ok = ratelimit.ping()
+    try:
+        if USE_DB:
+            dbmod.count_patterns()
+            db_ok = True
+    except Exception as exc:
+        log.warning("health/deep: db ping failed: %s", exc)
+
+    metrics.db_up.set(1 if db_ok else 0)
+    metrics.redis_up.set(1 if redis_ok else 0)
+    if USE_DB:
+        try:
+            pool = dbmod.get_pool()
+            stats = pool.get_stats()
+            metrics.db_pool_in_use.set(stats.get("pool_size", 0) - stats.get("pool_available", 0))
+            metrics.db_pool_size.set(stats.get("pool_size", 0))
+        except Exception:
+            pass
+
+    body = {
+        "status": "ok" if (db_ok or not USE_DB) and redis_ok else "degraded",
+        "version": app.version,
+        "db": {"up": db_ok, "configured": USE_DB},
+        "redis": {"up": redis_ok},
+    }
+    code = 200 if body["status"] == "ok" else 503
+    return JSONResponse(status_code=code, content=body)
+
+
+@app.get("/metrics", tags=["meta"], include_in_schema=False)
+async def prometheus_metrics() -> Response:
+    """Prometheus exposition endpoint.
+
+    Intentionally NOT behind X-API-Key: scrapers (Prometheus server, kube
+    probes) won't have one. If this is exposed publicly, gate it at the
+    nginx tier (allow only your scraper's IP / subnet).
+    """
+    payload, content_type = metrics.render()
+    return Response(content=payload, media_type=content_type)
+
+
 @app.get("/posts", response_model=List[dict], tags=["patterns"])
 async def list_posts(
     _: Annotated[str, Depends(require_api_key)],
@@ -346,6 +421,7 @@ async def search_posts(
     q = (q or "").strip()
     if not q:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "q parameter required")
+    metrics.patterns_search_total.labels(mode="lexical").inc()
     results = dbmod.search_patterns_lexical(q, limit=limit)
     return {"query": q, "count": len(results), "results": results}
 
@@ -363,6 +439,7 @@ async def search_posts_semantic(
     """
     if not USE_DB:
         return {"count": 0, "results": [], "note": "search disabled (db off)"}
+    metrics.patterns_search_total.labels(mode="semantic").inc()
     results = dbmod.search_patterns_semantic(body.embedding, limit=body.limit)
     return {"count": len(results), "results": results}
 
@@ -402,6 +479,7 @@ async def embed_pattern(
             status.HTTP_404_NOT_FOUND,
             f"no pattern with content_hash={body.content_hash!r}",
         )
+    metrics.embeddings_attached_total.inc()
     return EmbedResponse(
         content_hash=body.content_hash,
         dimension=len(body.embedding),
@@ -484,10 +562,12 @@ async def _create_post_impl(request: Request) -> PostResponse:
     if USE_DB:
         try:
             dbmod.insert_pattern(record)
+            metrics.patterns_created_total.inc()
         except psycopg.errors.UniqueViolation:
             # Same content already exists — return the existing record.
             existing = dbmod.get_pattern_by_hash(content_hash)
             if existing:
+                metrics.patterns_dedup_hits_total.inc()
                 return PostResponse(
                     post_id=str(existing["post_id"]),
                     content_hash=existing["content_hash"],

@@ -13,3 +13,9 @@ psycopg[binary,pool]==3.3.4
 
 # Redis client for sliding-window rate limiter.
 redis>=5,<6
+
+# Incremental schema migrations (v1.1.2+).
+alembic>=1.13,<2
+
+# Prometheus metrics exposition (v1.1.2+).
+prometheus-client>=0.21,<1
