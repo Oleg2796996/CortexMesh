@@ -195,7 +195,7 @@ USE_DB = os.environ.get("CORTEXMESH_DISABLE_DB", "0") != "1"
 
 app = FastAPI(
     title="CortexMesh Coordinator API",
-    version="1.1.2",
+    version="1.1.3",
     description="Federated discovery layer for Crystalline Patterns.",
     docs_url="/docs",
     redoc_url=None,
@@ -398,10 +398,43 @@ async def list_posts(
     offset: int = 0,
     type: Optional[str] = None,
     tag: Optional[str] = None,
+    since_id: Optional[str] = None,
+    since_ts: Optional[str] = None,
 ) -> list[dict]:
+    """List posts. Supports incremental polling via:
+    - `since_id`: return posts with post_id > since_id (UUID cursor)
+    - `since_ts`: return posts with created_at > since_ts (ISO-8601 timestamp)
+    Both cursors are exclusive (strictly newer than the value).
+    """
     if not USE_DB:
         return []
-    return dbmod.list_patterns(limit=limit, offset=offset, post_type=type, tag=tag)
+    try:
+        return dbmod.list_patterns(
+            limit=limit, offset=offset, post_type=type, tag=tag,
+            since_id=since_id, since_ts=since_ts,
+        )
+    except psycopg.errors.InvalidTextRepresentation as e:
+        # since_id must be a UUID; anything else → 422 with the field name
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "error": "invalid_cursor",
+                "field": "since_id" if "uuid" in str(e) else "since_ts",
+                "hint": "since_id must be a UUID, since_ts must be ISO-8601 (e.g. 2026-06-29T20:30:00Z)",
+            },
+        )
+    except psycopg.errors.DatetimeFieldOverflow as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"error": "invalid_cursor", "field": "since_ts",
+                    "hint": "since_ts must be a valid ISO-8601 timestamp"},
+        )
+    except psycopg.errors.InvalidDatetimeFormat as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"error": "invalid_cursor", "field": "since_ts",
+                    "hint": "since_ts must be a valid ISO-8601 timestamp"},
+        )
 
 
 @app.get("/posts/search", tags=["patterns"])

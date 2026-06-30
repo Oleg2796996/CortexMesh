@@ -112,39 +112,44 @@ def list_patterns(
     offset: int = 0,
     post_type: Optional[str] = None,
     tag: Optional[str] = None,
+    since_id: Optional[str] = None,
+    since_ts: Optional[str] = None,
 ) -> list[dict]:
     """Return up to `limit` patterns, optionally filtered.
 
     `tag` is matched as array containment (`tag = ANY(context_tags)`).
+    `since_id` returns posts with post_id > since_id (lexicographic UUID compare).
+    `since_ts` returns posts with created_at > since_ts (ISO-8601 timestamp).
+    Both are inclusive-exclusive cursors for incremental polling.
     """
     with connection() as conn, conn.cursor() as cur:
+        where_clauses = ["(%(ptype)s::text IS NULL OR post_type = %(ptype)s)"]
         if tag:
-            cur.execute(
-                """
-                SELECT post_id, content_hash, post_type, problem_statement,
-                       solution_or_insight, context_tags, confidence,
-                       created_by, has_embedding, created_at, updated_at
-                FROM patterns_v
-                WHERE (%(ptype)s::text IS NULL OR post_type = %(ptype)s)
-                  AND (%(tag)s::text = ANY(context_tags))
-                ORDER BY created_at DESC
-                LIMIT %(limit)s OFFSET %(offset)s
-                """,
-                {"ptype": post_type, "tag": tag, "limit": limit, "offset": offset},
-            )
-        else:
-            cur.execute(
-                """
-                SELECT post_id, content_hash, post_type, problem_statement,
-                       solution_or_insight, context_tags, confidence,
-                       created_by, has_embedding, created_at, updated_at
-                FROM patterns_v
-                WHERE (%(ptype)s::text IS NULL OR post_type = %(ptype)s)
-                ORDER BY created_at DESC
-                LIMIT %(limit)s OFFSET %(offset)s
-                """,
-                {"ptype": post_type, "limit": limit, "offset": offset},
-            )
+            where_clauses.append("(%(tag)s::text = ANY(context_tags))")
+        if since_id:
+            where_clauses.append("(post_id > %(since_id)s::uuid)")
+        if since_ts:
+            where_clauses.append("(created_at > %(since_ts)s::timestamptz)")
+
+        where_sql = " AND ".join(where_clauses)
+        sql = f"""
+            SELECT post_id, content_hash, post_type, problem_statement,
+                   solution_or_insight, context_tags, confidence,
+                   created_by, has_embedding, created_at, updated_at
+            FROM patterns_v
+            WHERE {where_sql}
+            ORDER BY created_at DESC
+            LIMIT %(limit)s OFFSET %(offset)s
+        """
+        params = {
+            "ptype": post_type,
+            "tag": tag,
+            "since_id": since_id,
+            "since_ts": since_ts,
+            "limit": limit,
+            "offset": offset,
+        }
+        cur.execute(sql, params)
         return list(cur.fetchall())
 
 

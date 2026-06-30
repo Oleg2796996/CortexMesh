@@ -236,11 +236,17 @@ let state = {
   embedOnly: false,
 };
 
+// The page may be served behind a reverse-proxy prefix (e.g. /dashboard/),
+// so build API URLs relative to the current directory path rather than the
+// origin root. Strip trailing slashes.
+const BASE = location.pathname.replace(/\/+$/, '') + '/';
+function api(path) { return BASE + path; }
+
 async function load() {
   const conn = document.getElementById('conn');
   const last = document.getElementById('lastSync');
   try {
-    const r = await fetch('/api/data', { cache: 'no-store' });
+    const r = await fetch(api('api/data'), { cache: 'no-store' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
     state.posts = d.posts || [];
